@@ -1780,4 +1780,167 @@ redis-cli info commandstats | grep -E "(calls|usec)"
    fi
    ```
 
-通过理解这些分片策略的特点和风险，可以在架构设计阶段就预防数据倾斜问题。对于已存在的倾斜，需要结合监控数据选择最适合的调整策略。s
+通过理解这些分片策略的特点和风险，可以在架构设计阶段就预防数据倾斜问题。对于已存在的倾斜，需要结合监控数据选择最适合的调整策略。
+
+
+
+# Redis 事务实现机制详解
+
+Redis 事务提供了一种将多个命令打包，然后一次性、按顺序执行的机制。与关系型数据库的事务不同，Redis 事务不支持回滚(Rollback)，但能保证原子性和隔离性。
+
+## Redis 事务的核心命令
+
+1. **MULTI**：标记事务开始
+2. **EXEC**：执行事务中的所有命令
+3. **DISCARD**：取消事务
+4. **WATCH**：监视一个或多个键，如果在事务执行前这些键被修改，则事务将被打断
+5. **UNWATCH**：取消对所有键的监视
+
+## Redis 事务的实现原理
+
+### 1. 事务队列
+
+当客户端执行 `MULTI` 命令后，Redis 会将该客户端的状态设置为"事务状态"。在此状态下：
+
+- 所有非事务命令（除了 `EXEC`、`DISCARD`、`WATCH`、`MULTI`）都会被放入一个**事务队列**
+- 命令不会立即执行，而是返回 `QUEUED` 响应
+
+### 2. 执行事务
+
+当客户端发送 `EXEC` 命令时：
+
+1. Redis 会顺序执行事务队列中的所有命令
+2. 所有命令执行完毕后，一次性返回所有命令的结果
+3. 清除该客户端的事务状态
+
+### 3. 乐观锁机制 (WATCH)
+
+Redis 通过 `WATCH` 命令实现乐观锁：
+
+```python
+WATCH key1 key2...  # 监视一个或多个键
+MULTI               # 开始事务
+# 一系列命令
+EXEC                # 执行事务
+```
+
+- 如果在 `WATCH` 和 `EXEC` 之间，有任何被监视的键被其他客户端修改
+- 那么 `EXEC` 将返回 `nil`，表示事务执行失败
+- 客户端可以选择重试或放弃
+
+## Redis 事务的特性
+
+1. **原子性**：
+   - 所有命令要么全部执行，要么全部不执行
+   - 但**没有回滚机制**：即使某个命令失败，后面的命令仍会执行
+
+2. **隔离性**：
+   - 事务中的所有命令都是串行化执行的
+   - 不会被其他客户端的命令打断
+
+3. **无一致性保证**：
+   - Redis 不保证事务中的所有命令都能成功执行
+   - 如果某个命令有语法错误，其他命令仍会执行
+
+4. **无持久性保证**：
+   - 是否持久化取决于 Redis 的持久化配置
+
+## Redis 事务的三种执行结果
+
+1. **全部执行成功**：
+   - 所有命令被顺序执行
+   - EXEC 返回所有命令的结果数组
+
+2. **放弃事务**：
+   - 使用 DISCARD 清空事务队列
+   - 退出事务状态
+
+3. **执行时错误**：
+   - 命令入队时错误（如语法错误）：整个事务都不会执行
+   - 命令执行时错误（如对字符串执行 LPOP）：只有该命令失败，其他命令仍执行
+
+## Java 实现示例 (Jedis)
+
+```java
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Transaction;
+import redis.clients.jedis.Response;
+
+public class RedisTransactionExample {
+    public static void main(String[] args) {
+        Jedis jedis = new Jedis("localhost");
+        
+        // 简单事务示例
+        simpleTransaction(jedis);
+        
+        // 带WATCH的事务示例
+        transactionWithWatch(jedis);
+        
+        jedis.close();
+    }
+    
+    // 简单事务
+    public static void simpleTransaction(Jedis jedis) {
+        // 开启事务
+        Transaction t = jedis.multi();
+        
+        // 将命令放入队列
+        t.set("key1", "value1");
+        t.set("key2", "value2");
+        t.incr("counter");
+        
+        // 执行事务
+        t.exec();
+    }
+    
+    // 带WATCH的事务（乐观锁）
+    public static void transactionWithWatch(Jedis jedis) {
+        String key = "balance";
+        
+        // 设置初始值
+        jedis.set(key, "100");
+        
+        // 监视键
+        jedis.watch(key);
+        
+        // 获取当前值
+        int currentBalance = Integer.parseInt(jedis.get(key));
+        int newBalance = currentBalance + 50;
+        
+        // 开启事务
+        Transaction t = jedis.multi();
+        t.set(key, String.valueOf(newBalance));
+        
+        // 执行事务
+        List<Object> results = t.exec();
+        
+        if (results == null) {
+            System.out.println("事务执行失败，键被修改");
+        } else {
+            System.out.println("事务执行成功，新余额: " + newBalance);
+        }
+    }
+}
+```
+
+## Redis 事务 vs Lua 脚本
+
+对于复杂操作，Lua 脚本通常是更好的选择：
+
+| 特性        | 事务               | Lua 脚本            |
+|-----------|------------------|--------------------|
+| 原子性       | 是                | 是                 |
+| 隔离性       | 是                | 是                 |
+| 复杂性       | 简单命令序列          | 可以包含复杂逻辑和控制流      |
+| 性能        | 较好               | 更好（减少网络往返）        |
+| 错误处理      | 无回滚             | 可以自定义错误处理逻辑       |
+| 可读性       | 较低（分散的命令）       | 较高（集中在一个脚本中）      |
+
+## 实际应用建议
+
+1. **简单操作**：使用事务
+2. **复杂操作**：使用 Lua 脚本
+3. **需要原子性检查并设置**：使用 WATCH+MULTI+EXEC
+4. **高性能场景**：优先考虑 Lua 脚本
+
+Redis 事务虽然不如关系型数据库的事务强大，但在适当的场景下仍然是很有用的工具，特别是在需要保证一系列命令原子性执行而又不需要复杂回滚逻辑的情况下。
